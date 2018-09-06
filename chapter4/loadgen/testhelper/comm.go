@@ -1,0 +1,140 @@
+package testhelper
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"net"
+	"time"
+
+	loadgenlib "gopcp.v2/chapter4/loadgen/lib"
+)
+
+const (
+	DELIM = '\n' // 分隔符。
+)
+
+// operators 代表操作符切片。
+var operators = []string{"+", "-", "*", "/"}
+
+// TCPComm 表示TCP通讯器的结构。
+type TCPComm struct {
+	addr string
+}
+
+// NewTCPComm 会新建一个TCP通讯器。
+func NewTCPComm(addr string) loadgenlib.Caller {
+	return &TCPComm{addr: addr}
+}
+
+// BuildReq 会构建一个请求。
+func (comm *TCPComm) BuildReq() loadgenlib.RawReq {
+	id := time.Now().UnixNano() //纳秒时间戳
+	sreq := ServerReq{
+		ID: id,
+		Operands: []int{
+			int(rand.Int31n(1000) + 1),
+			int(rand.Int31n(1000) + 1)},
+		Operator: func() string {
+			return operators[rand.Int31n(100)%4]
+		}(),
+	}
+	bytes, err := json.Marshal(sreq) //进行json编码
+	if err != nil {
+		panic(err)
+	}
+	rawReq := loadgenlib.RawReq{ID: id, Req: bytes}
+	return rawReq
+}
+
+// Call 会发起一次通讯。
+func (comm *TCPComm) Call(req []byte, timeoutNS time.Duration) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", comm.addr, timeoutNS)
+	if err != nil {
+		return nil, err
+	}
+	_, err = write(conn, req, DELIM)
+	if err != nil {
+		return nil, err
+	}
+	return read(conn, DELIM)
+}
+
+// CheckResp 会检查响应内容。
+func (comm *TCPComm) CheckResp(rawReq loadgenlib.RawReq, rawResp loadgenlib.RawResp) *loadgenlib.CallResult {
+	var commResult loadgenlib.CallResult
+	commResult.ID = rawResp.ID
+	commResult.Req = rawReq
+	commResult.Resp = rawResp
+	// 1.解析发送到服务器的请求
+	var sreq ServerReq
+	err := json.Unmarshal(rawReq.Req, &sreq)
+	if err != nil {
+		commResult.Code = loadgenlib.RET_CODE_FATAL_CALL
+		commResult.Msg = fmt.Sprintf("Incorrectly formatted Req: %s!\n", string(rawReq.Req))
+		return &commResult
+	}
+	// 2.解析服务器响应的结果
+	var sresp ServerResp
+	err = json.Unmarshal(rawResp.Resp, &sresp)
+	if err != nil {
+		commResult.Code = loadgenlib.RET_CODE_ERROR_RESPONSE
+		commResult.Msg = fmt.Sprintf("Incorrectly formatted Resp: %s!\n", string(rawResp.Resp))
+		return &commResult
+	}
+	// 3.比较"服务器响应结果的ID"和"发送到服务器的请求的ID"
+	if sresp.ID != sreq.ID {
+		commResult.Code = loadgenlib.RET_CODE_ERROR_RESPONSE
+		commResult.Msg = fmt.Sprintf("Inconsistent raw id! (%d != %d)\n", rawReq.ID, rawResp.ID)
+		return &commResult
+	}
+	// 4.服务器响应结果是否出错
+	if sresp.Err != nil {
+		commResult.Code = loadgenlib.RET_CODE_ERROR_CALEE
+		commResult.Msg = fmt.Sprintf("Abnormal server: %s!\n", sresp.Err)
+		return &commResult
+	}
+	// 5.服务器响应结果是否符合请求预期值
+	if sresp.Result != op(sreq.Operands, sreq.Operator) {
+		commResult.Code = loadgenlib.RET_CODE_ERROR_RESPONSE
+		commResult.Msg = fmt.Sprintf("Incorrect result: %s!\n", genFormula(sreq.Operands, sreq.Operator, sresp.Result, false))
+		return &commResult
+	}
+	// 6.输出计算过程
+	commResult.Code = loadgenlib.RET_CODE_SUCCESS
+	commResult.Msg = fmt.Sprintf("Success. (%s)", sresp.Formula)
+	return &commResult
+}
+
+// read 从连接中读数据，直到遇到参数delim代表的字节。
+func read(conn net.Conn, delim byte) ([]byte, error) {
+	readBytes := make([]byte, 1)
+	var buffer bytes.Buffer
+	for {
+		_, err := conn.Read(readBytes)
+		if err != nil {
+			return nil, err
+		}
+		readByte := readBytes[0]
+		if readByte == delim {
+			break
+		}
+		buffer.WriteByte(readByte)
+	}
+	return buffer.Bytes(), nil
+}
+
+// write 向连接写数据，并在最后追加参数delim代表的字节。
+func write(conn net.Conn, content []byte, delim byte) (int, error) {
+	writer := bufio.NewWriter(conn)
+	n, err := writer.Write(content)
+	if err == nil {
+		writer.WriteByte(delim) //追加参数delim代表的字节
+	}
+	if err == nil {
+		err = writer.Flush()
+	}
+	return n, err
+}
